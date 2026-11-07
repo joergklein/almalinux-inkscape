@@ -1,0 +1,233 @@
+name: Build Inkscape RPM for AlmaLinux 10
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 1 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build native RPM
+    runs-on: ubuntu-latest
+
+    container:
+      image: almalinux:10
+      options: --privileged
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y epel-release
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled crb
+
+          dnf install -y \
+            git \
+            curl \
+            tar \
+            xz \
+            rpm-build \
+            rpmdevtools \
+            mock \
+            mock-core-configs \
+            findutils \
+            python3
+
+          test -f /etc/mock/alma+epel-10-x86_64.cfg
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Prepare Inkscape sources
+        run: |
+          chmod +x scripts/prepare-sources.sh
+          ./scripts/prepare-sources.sh
+
+      - name: Inspect Inkscape initialization
+        run: |
+          set -euo pipefail
+
+          ARCHIVE=$(find SOURCES -maxdepth 1 -name 'inkscape-*.tar.xz' -print -quit)
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "Inkscape source archive not found."
+            exit 1
+          fi
+
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+
+          tar -xf "$ARCHIVE" -C "$TMP"
+
+          FONT_FILE=$(find "$TMP" -path '*/src/libnrtype/font-factory.cpp' -print -quit)
+
+          if [ -z "$FONT_FILE" ]; then
+            echo "font-factory.cpp not found."
+            exit 1
+          fi
+
+          echo "===== font-factory.cpp ====="
+          sed -n '190,240p' "$FONT_FILE"
+
+          echo "===== on_startup ====="
+          grep -R -n -A50 'InkscapeApplication::on_startup' "$TMP" || true
+
+      - name: Check for new Inkscape version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_VERSION=$(find SOURCES -type f \
+            -name 'inkscape-*.tar.xz' \
+            -printf '%f\n' |
+            sed -nE 's/^inkscape-([0-9][0-9A-Za-z.+~-]*)\.tar\.xz$/\1/p' |
+            sort -Vu |
+            tail -n 1)
+
+          if [ -z "$SOURCE_VERSION" ]; then
+            echo "Could not determine Inkscape source version."
+            exit 1
+          fi
+
+          RELEASES=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+
+          CURRENT_VERSION=$(printf '%s' "$RELEASES" | python3 -c '
+          import json
+          import re
+          import sys
+
+          releases = json.load(sys.stdin)
+          versions = []
+
+          for release in releases:
+              if release.get("draft") or release.get("prerelease"):
+                  continue
+
+              for asset in release.get("assets", []):
+                  name = asset.get("name", "")
+                  match = re.fullmatch(
+                      r"inkscape-(\d+(?:\.\d+)+)-(\d+)\.el10\.x86_64\.rpm",
+                      name
+                  )
+                  if match:
+                      versions.append(
+                          (match.group(1), int(match.group(2)))
+                      )
+
+          if versions:
+              versions.sort(
+                  key=lambda item: (
+                      tuple(int(x) for x in item[0].split(".")),
+                      item[1]
+                  )
+              )
+              print(versions[-1][0])
+          else:
+              print("")
+          ')
+
+          echo "Upstream version: $SOURCE_VERSION"
+          echo "Published RPM version: ${CURRENT_VERSION:-none}"
+
+          if [ -n "$CURRENT_VERSION" ] && \
+            [ "$(printf '%s\n' "$SOURCE_VERSION" "$CURRENT_VERSION" | sort -V | tail -n 1)" = "$CURRENT_VERSION" ]; then
+            echo "No newer Inkscape version available."
+            echo "update_available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Inkscape version available: $SOURCE_VERSION"
+            echo "update_available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build RPM packages
+        if: steps.check.outputs.update_available == 'true'
+        run: |
+          chmod +x scripts/build-rpm.sh
+          ./scripts/build-rpm.sh
+
+      - name: Verify RPM packages
+        if: steps.check.outputs.update_available == 'true'
+        run: |
+          find RPMS -type f -name '*.rpm' -print
+          test -n "$(find RPMS -type f -name '*.rpm' -print -quit)"
+
+      - name: Collect RPM packages
+        if: steps.check.outputs.update_available == 'true'
+        run: |
+          chmod +x scripts/collect-rpms.sh
+          ./scripts/collect-rpms.sh
+
+      - name: Prepare release assets
+        if: steps.check.outputs.update_available == 'true'
+        id: release
+        run: |
+          set -euo pipefail
+
+          RPM_FILE=$(find release-assets \
+            -maxdepth 1 \
+            -type f \
+            -name 'inkscape-[0-9]*.el10.x86_64.rpm' \
+            ! -name '*debuginfo*' \
+            ! -name '*debugsource*' \
+            -print -quit)
+
+          if [ -z "$RPM_FILE" ]; then
+            echo "Main x86_64 RPM package not found."
+            exit 1
+          fi
+
+          VERSION=$(rpm -qp --qf '%{VERSION}' "$RPM_FILE")
+          RELEASE=$(rpm -qp --qf '%{RELEASE}' "$RPM_FILE")
+          ARCH=$(rpm -qp --qf '%{ARCH}' "$RPM_FILE")
+
+          if [ "$VERSION" != "${{ steps.check.outputs.version }}" ]; then
+            echo "RPM version does not match source version."
+            exit 1
+          fi
+
+          if [ "$RELEASE" != "1.el10" ] || [ "$ARCH" != "x86_64" ]; then
+            echo "Unexpected RPM release or architecture: $RELEASE.$ARCH"
+            exit 1
+          fi
+
+          RPM_TAG="${VERSION}-${RELEASE}"
+
+          cp "$RPM_FILE" release-assets/inkscape-latest.x86_64.rpm
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+          echo "rpm_tag=$RPM_TAG" >> "$GITHUB_OUTPUT"
+          echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
+
+          echo "Prepared RPM: $RPM_FILE"
+          echo "RPM release: $RPM_TAG"
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.update_available == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.rpm_tag }}
+          name: Inkscape ${{ steps.release.outputs.rpm_tag }} for AlmaLinux 10 (x86_64)
+          body: |
+            Native RPM package of Inkscape ${{ steps.release.outputs.rpm_tag }}
+            for AlmaLinux 10 (x86_64).
+
+            Available downloads:
+            - Versioned RPM package
+            - inkscape-latest.x86_64.rpm
+          files: |
+            ${{ steps.release.outputs.rpm_file }}
+            release-assets/inkscape-latest.x86_64.rpm
+          overwrite_files: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,11 @@
+diff --git a/src/inkscape-application.cpp b/src/inkscape-application.cpp
+--- a/src/inkscape-application.cpp
++++ b/src/inkscape-application.cpp
+@@ -192,1 +192,2 @@
++        if (_with_gui) {
+         if (auto recentmanager = Gtk::RecentManager::get_default()) {
+@@ -214,3 +215,4 @@
+         }
++        }
+
+         document_add (document);

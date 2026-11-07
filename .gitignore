@@ -1,0 +1,31 @@
+# Downloaded Inkscape sources
+SOURCES/*.tar.*
+SOURCES/*.tar
+
+# RPM build directories
+BUILD/
+BUILDROOT/
+RPMS/
+SRPMS/
+
+# Release assets
+release-assets/
+
+# Temporary build files
+*.log
+*.tmp
+*.bak
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
